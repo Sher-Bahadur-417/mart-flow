@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: martflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: martflow
+      POSTGRES_PASSWORD: martflow
+      POSTGRES_DB: martflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - martflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U martflow -d martflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  martflow_pgdata:
