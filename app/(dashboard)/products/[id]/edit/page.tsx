@@ -1,5 +1,5 @@
 import { updateProduct } from "@/lib/inventory/actions";
-import { prisma } from "@/lib/db";
+import { getProductWithRelations, listBrands, listCategories, listUnits } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader, Field, NativeSelect } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -16,13 +16,10 @@ export default async function EditProductPage({
   const user = await requireStorePermission("products");
   const { id } = await params;
   const [product, categories, brands, units] = await Promise.all([
-    prisma.product.findFirst({
-      where: { id, storeId: user.storeId },
-      include: { barcodes: true },
-    }),
-    prisma.category.findMany({ where: { storeId: user.storeId } }),
-    prisma.brand.findMany({ where: { storeId: user.storeId } }),
-    prisma.unit.findMany({ where: { storeId: user.storeId } }),
+    getProductWithRelations(user.storeId, id),
+    listCategories(user.storeId),
+    listBrands(user.storeId),
+    listUnits(user.storeId),
   ]);
   if (!product) {
     notFound();

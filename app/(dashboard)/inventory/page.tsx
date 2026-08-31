@@ -1,5 +1,5 @@
 import { adjustStock, recordDamage } from "@/lib/inventory/actions";
-import { prisma } from "@/lib/db";
+import { getInventorySnapshot } from "@/lib/reports/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader, EmptyState } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -9,11 +9,7 @@ export const metadata = { title: "Inventory" };
 
 export default async function InventoryPage() {
   const user = await requireStorePermission("inventory");
-  const rows = await prisma.inventory.findMany({
-    where: { storeId: user.storeId },
-    include: { product: true },
-    orderBy: { product: { name: "asc" } },
-  });
+  const rows = await getInventorySnapshot(user.storeId);
 
   return (
     <div className="flex flex-col gap-4 p-6">

@@ -3,8 +3,8 @@ import Link from "next/link";
 import { PageHeader } from "@/components/layout/page-header";
 import { SalesTrendChart } from "@/components/reports/sales-trend-chart";
 import { buttonVariants } from "@/components/ui/button";
-import { prisma } from "@/lib/db";
 import { requireStoreUser } from "@/lib/auth/store";
+import { listNotifications } from "@/lib/data/queries";
 import { getDashboardMetrics, getSalesTrend } from "@/lib/reports/queries";
 import { formatMoney } from "@/lib/utils/money";
 import { cn } from "@/lib/utils";
@@ -13,17 +13,14 @@ export const metadata = { title: "Dashboard" };
 
 export default async function DashboardPage() {
   const user = await requireStoreUser();
-  const [metrics, trend, unread] = await Promise.all([
+  const [metrics, trend, notifications] = await Promise.all([
     getDashboardMetrics(user.storeId),
     getSalesTrend(user.storeId),
-    prisma.notification.count({
-      where: {
-        storeId: user.storeId,
-        isRead: false,
-        OR: [{ userId: null }, { userId: user.id }],
-      },
-    }),
+    listNotifications(user.storeId),
   ]);
+  const unread = notifications.filter(
+    (item) => !item.isRead && (item.userId == null || item.userId === user.id),
+  ).length;
 
   const cards = [
     { label: "Today's sales", value: formatMoney(metrics.revenue) },

@@ -1,5 +1,5 @@
 import { createProduct } from "@/lib/inventory/actions";
-import { prisma } from "@/lib/db";
+import { listBrands, listCategories, listUnits } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader, Field, NativeSelect } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -10,9 +10,9 @@ export const metadata = { title: "New product" };
 export default async function NewProductPage() {
   const user = await requireStorePermission("products");
   const [categories, brands, units] = await Promise.all([
-    prisma.category.findMany({ where: { storeId: user.storeId } }),
-    prisma.brand.findMany({ where: { storeId: user.storeId } }),
-    prisma.unit.findMany({ where: { storeId: user.storeId } }),
+    listCategories(user.storeId),
+    listBrands(user.storeId),
+    listUnits(user.storeId),
   ]);
 
   return (

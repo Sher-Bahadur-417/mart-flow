@@ -5,11 +5,14 @@ import { ResetPasswordForm } from "@/components/employees/reset-password-form";
 import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { prisma } from "@/lib/db";
 import {
   resetEmployeePassword,
   setEmployeeActive,
 } from "@/lib/employees/actions";
+import {
+  getEmployeeDetail,
+  listEmployeeAuditLogs,
+} from "@/lib/employees/queries";
 import { canManageTarget } from "@/lib/employees/rules";
 import { requireStorePermission } from "@/lib/permissions";
 import { formatMoney } from "@/lib/utils/money";
@@ -31,56 +34,17 @@ export default async function EmployeeDetailPage({
 }) {
   const actor = await requireStorePermission("users");
   const { id } = await params;
-  const employee = await prisma.user.findFirst({
-    where: { id, storeId: actor.storeId },
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      username: true,
-      isActive: true,
-      lastLoginAt: true,
-      createdAt: true,
-      role: { select: { code: true, name: true } },
-      employee: true,
-      grants: { select: { permission: { select: { code: true, name: true } } } },
-    },
-  });
+  const employee = await getEmployeeDetail(actor.storeId, id);
   if (!employee) {
     notFound();
   }
 
-  const [auditLogs, rolePermissions] = await Promise.all([
-    prisma.auditLog.findMany({
-      where: {
-        storeId: actor.storeId,
-        OR: [
-          { entityId: employee.id },
-          { userId: employee.id },
-        ],
-      },
-      orderBy: { createdAt: "desc" },
-      take: 75,
-      select: {
-        id: true,
-        action: true,
-        entity: true,
-        metadata: true,
-        createdAt: true,
-        ipAddress: true,
-        user: { select: { name: true, email: true } },
-      },
-    }),
-    prisma.rolePermission.findMany({
-      where: { role: { code: employee.role.code } },
-      select: { permission: { select: { code: true, name: true } } },
-    }),
-  ]);
+  const auditLogs = await listEmployeeAuditLogs(actor.storeId, employee.id);
 
   const assigned =
     employee.grants.length > 0
       ? employee.grants.map((grant) => grant.permission.code)
-      : rolePermissions.map((entry) => entry.permission.code);
+      : employee.rolePermissions.map((entry) => entry.permission.code);
   const canManage = canManageTarget(actor.roleCode, employee.role.code);
   const resetAction = resetEmployeePassword.bind(null, employee.id);
   const deactivate = setEmployeeActive.bind(null, employee.id, false);

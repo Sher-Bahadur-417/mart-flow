@@ -2,7 +2,7 @@ import Link from "next/link";
 
 import { PageHeader, EmptyState } from "@/components/layout/page-header";
 import { buttonVariants } from "@/components/ui/button";
-import { prisma } from "@/lib/db";
+import { attachProductRelations, listProducts } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { formatMoney } from "@/lib/utils/money";
 import { cn } from "@/lib/utils";
@@ -15,19 +15,20 @@ export default async function ProductsPage({
   const user = await requireStorePermission("products");
   const params = await searchParams;
   const q = typeof params.q === "string" ? params.q : "";
-  const products = await prisma.product.findMany({
-    where: {
-      storeId: user.storeId,
-      OR: q
-        ? [
-            { name: { contains: q, mode: "insensitive" } },
-            { sku: { contains: q, mode: "insensitive" } },
-          ]
-        : undefined,
-    },
-    include: { inventory: true, category: true },
-    orderBy: { name: "asc" },
+  const all = await listProducts(user.storeId);
+  const filtered = all.filter((product) => {
+    if (!q) {
+      return true;
+    }
+    const term = q.toLowerCase();
+    return (
+      product.name.toLowerCase().includes(term) ||
+      product.sku.toLowerCase().includes(term)
+    );
   });
+  const products = (await attachProductRelations(user.storeId, filtered)).sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
 
   return (
     <div className="flex flex-col gap-4 p-6">

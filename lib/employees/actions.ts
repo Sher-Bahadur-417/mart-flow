@@ -1,13 +1,25 @@
 "use server";
 
-import { Prisma } from "@prisma/client";
+import { FieldValue } from "firebase-admin/firestore";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
-import { ROLE_CODES } from "@/constants/permissions";
+import { ROLE_CODES, type RoleCode } from "@/constants/permissions";
 import { writeAuditLog } from "@/lib/auth/audit";
-import { hashPassword } from "@/lib/auth/password";
-import { prisma } from "@/lib/db";
+import { getRoleDoc, listRoleDocs } from "@/lib/auth/bootstrap";
+import type { StoreUser } from "@/lib/auth/store";
+import { collections, newId } from "@/lib/data/fs";
+import {
+  findUserByEmail,
+  findUserByUsername,
+  getCounterValue,
+  getEmployeeByUserId,
+  getUser,
+  listEmployeesByStore,
+  listUsersByStore,
+} from "@/lib/data/queries";
+import { adminAuth, firestore } from "@/lib/firebase-admin";
+import { mapAdminAuthError } from "@/lib/firebase/rest-auth";
 import {
   assignableRoles,
   canAssignRole,
@@ -28,30 +40,11 @@ import {
   resetPasswordSchema,
   type EmployeeFormState,
 } from "@/lib/validation/employees";
-import type { StoreUser } from "@/lib/auth/store";
-
-function uniqueFieldError(error: unknown) {
-  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-    const target = error.meta?.target;
-    const fields = Array.isArray(target) ? target.join(" ") : String(target ?? "");
-    if (fields.includes("email")) {
-      return "That email is already in use.";
-    }
-    if (fields.includes("username")) {
-      return "That username is already in use.";
-    }
-    if (fields.includes("employeeCode")) {
-      return "That Employee ID is already in use.";
-    }
-    return "A unique field is already in use.";
-  }
-  return null;
-}
 
 function formError(error: unknown): EmployeeFormState {
-  const unique = uniqueFieldError(error);
-  if (unique) {
-    return { error: unique };
+  const mapped = mapAdminAuthError(error);
+  if (mapped) {
+    return { error: mapped };
   }
   if (error instanceof Error) {
     return { error: error.message };
@@ -76,11 +69,7 @@ function readEmployeeForm(formData: FormData) {
   };
 }
 
-async function uniqueUsername(
-  tx: Prisma.TransactionClient,
-  base: string,
-  excludeUserId?: string,
-) {
+async function uniqueUsername(base: string, excludeUserId?: string) {
   const parsed = USERNAME_SCHEMA.safeParse(base);
   let candidate = parsed.success ? parsed.data : normalizeUsername(base);
   if (candidate.length < 3) {
@@ -89,14 +78,8 @@ async function uniqueUsername(
 
   for (let index = 0; index < 30; index += 1) {
     const username = index === 0 ? candidate : `${candidate}${index + 1}`;
-    const exists = await tx.user.findFirst({
-      where: {
-        username,
-        ...(excludeUserId ? { id: { not: excludeUserId } } : {}),
-      },
-      select: { id: true },
-    });
-    if (!exists) {
+    const exists = await findUserByUsername(username);
+    if (!exists || exists.id === excludeUserId) {
       return username;
     }
   }
@@ -104,29 +87,19 @@ async function uniqueUsername(
   return `${candidate}${Date.now().toString(36)}`.slice(0, 32);
 }
 
-async function allocateEmployeeCode(
-  tx: Prisma.TransactionClient,
-  storeId: string,
-  requested?: string,
-) {
+async function allocateEmployeeCode(storeId: string, requested?: string) {
+  const employees = await listEmployeesByStore(storeId);
   if (requested) {
-    const exists = await tx.employee.findUnique({
-      where: { storeId_employeeCode: { storeId, employeeCode: requested } },
-      select: { id: true },
-    });
-    if (exists) {
+    if (employees.some((row) => row.employeeCode === requested)) {
       throw new Error("That Employee ID is already in use.");
     }
     return requested;
   }
 
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    const code = await nextDocumentNumber(tx, storeId, "employee", "EMP");
-    const exists = await tx.employee.findUnique({
-      where: { storeId_employeeCode: { storeId, employeeCode: code } },
-      select: { id: true },
-    });
-    if (!exists) {
+    const code = await nextDocumentNumber(storeId, "employee", "EMP");
+    const latest = await listEmployeesByStore(storeId);
+    if (!latest.some((row) => row.employeeCode === code)) {
       return code;
     }
   }
@@ -134,38 +107,31 @@ async function allocateEmployeeCode(
   throw new Error("Could not allocate a unique Employee ID.");
 }
 
-async function replaceUserPermissions(
-  tx: Prisma.TransactionClient,
-  userId: string,
-  codes: string[],
-) {
-  const permissions = codes.length
-    ? await tx.permission.findMany({ where: { code: { in: codes } } })
-    : [];
-  await tx.userPermission.deleteMany({ where: { userId } });
-  if (permissions.length > 0) {
-    await tx.userPermission.createMany({
-      data: permissions.map((permission) => ({
-        userId,
-        permissionId: permission.id,
-      })),
+async function replaceUserPermissions(userId: string, codes: string[]) {
+  const existing = await firestore
+    .collection("userPermissions")
+    .where("userId", "==", userId)
+    .get();
+  const batch = firestore.batch();
+  existing.docs.forEach((doc) => batch.delete(doc.ref));
+  for (const code of codes) {
+    batch.set(firestore.collection("userPermissions").doc(`${userId}_${code}`), {
+      userId,
+      permissionId: code,
+      permissionCode: code,
     });
   }
+  await batch.commit();
 }
 
-async function countOtherActiveOwners(
-  tx: Prisma.TransactionClient,
-  storeId: string,
-  excludeUserId: string,
-) {
-  return tx.user.count({
-    where: {
-      storeId,
-      isActive: true,
-      id: { not: excludeUserId },
-      role: { code: ROLE_CODES.OWNER },
-    },
-  });
+async function countOtherActiveOwners(storeId: string, excludeUserId: string) {
+  const users = await listUsersByStore(storeId);
+  return users.filter(
+    (row) =>
+      row.id !== excludeUserId &&
+      row.isActive &&
+      row.roleCode === ROLE_CODES.OWNER,
+  ).length;
 }
 
 function resolvePermissions(
@@ -212,12 +178,16 @@ function parseOptionalEmployeeCode(raw: string) {
   return normalizeEmployeeCode(parsed.data);
 }
 
+async function rollbackAuthUser(uid: string) {
+  await adminAuth.deleteUser(uid).catch((error) => {
+    console.error("Failed to delete Firebase Auth user after employee create error", error);
+  });
+}
+
 export async function suggestEmployeeCode() {
   const actor = await requireStorePermission("users");
-  const counter = await prisma.counter.findUnique({
-    where: { storeId_key: { storeId: actor.storeId, key: "employee" } },
-  });
-  return `EMP-${String((counter?.value ?? 0) + 1).padStart(6, "0")}`;
+  const value = await getCounterValue(actor.storeId, "employee");
+  return `EMP-${String(value + 1).padStart(6, "0")}`;
 }
 
 export async function createEmployee(
@@ -246,9 +216,7 @@ export async function createEmployee(
     return formError(error);
   }
 
-  const role = await prisma.role.findUnique({
-    where: { code: parsed.data.roleCode },
-  });
+  const role = getRoleDoc(parsed.data.roleCode);
   if (!role) {
     return { error: "Role not found." };
   }
@@ -258,69 +226,90 @@ export async function createEmployee(
     parsed.data.roleCode,
     parsed.data.permissions,
   );
-  const passwordHash = await hashPassword(raw.password);
   const phone = parsed.data.phone?.trim() || null;
   const jobTitle = parsed.data.jobTitle?.trim() || null;
+  const isActive = parsed.data.isActive ?? true;
+  const email = parsed.data.email;
 
+  let userId: string | undefined;
   try {
-    const created = await prisma.$transaction(async (tx) => {
-      const nextUsername =
-        username ||
-        (await uniqueUsername(tx, parsed.data.email.split("@")[0] ?? "employee"));
-      if (username) {
-        const taken = await tx.user.findUnique({
-          where: { username: nextUsername },
-          select: { id: true },
-        });
-        if (taken) {
-          throw new Error("That username is already in use.");
-        }
-      }
+    if (await findUserByEmail(email)) {
+      throw new Error("That email is already in use.");
+    }
+    const nextUsername =
+      username || (await uniqueUsername(email.split("@")[0] ?? "employee"));
+    if (username && (await findUserByUsername(nextUsername))) {
+      throw new Error("That username is already in use.");
+    }
 
-      const user = await tx.user.create({
-        data: {
-          name: parsed.data.name,
-          email: parsed.data.email,
-          username: nextUsername,
-          passwordHash,
-          roleId: role.id,
-          storeId: actor.storeId,
-          isActive: parsed.data.isActive ?? true,
-        },
-      });
-
-      const code = await allocateEmployeeCode(tx, actor.storeId, employeeCode);
-      await tx.employee.create({
-        data: {
-          storeId: actor.storeId,
-          userId: user.id,
-          employeeCode: code,
-          phone,
-          jobTitle,
-          hireDate: new Date(),
-          salary: parsed.data.salary ? toMoney(parsed.data.salary) : null,
-          isActive: parsed.data.isActive ?? true,
-        },
-      });
-      await replaceUserPermissions(tx, user.id, permissions);
-      return { user, employeeCode: code, username: nextUsername };
+    const authUser = await adminAuth.createUser({
+      email,
+      password: raw.password,
+      displayName: parsed.data.name,
+      disabled: !isActive,
     });
+    userId = authUser.uid;
+
+    const code = await allocateEmployeeCode(actor.storeId, employeeCode);
+    const employeeId = newId(collections.employees);
+    const now = FieldValue.serverTimestamp();
+    const batch = firestore.batch();
+    batch.set(firestore.collection(collections.users).doc(userId), {
+      id: userId,
+      storeId: actor.storeId,
+      roleId: role.id,
+      roleCode: role.code,
+      roleName: role.name,
+      name: parsed.data.name,
+      email,
+      username: nextUsername,
+      phone,
+      permissions,
+      isActive,
+      lastLoginAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    batch.set(firestore.collection(collections.employees).doc(employeeId), {
+      id: employeeId,
+      storeId: actor.storeId,
+      userId,
+      employeeCode: code,
+      phone,
+      jobTitle,
+      hireDate: now,
+      salary: parsed.data.salary ? toMoney(parsed.data.salary).toString() : null,
+      isActive,
+      createdAt: now,
+      updatedAt: now,
+    });
+    for (const permission of permissions) {
+      batch.set(firestore.collection("userPermissions").doc(`${userId}_${permission}`), {
+        userId,
+        permissionId: permission,
+        permissionCode: permission,
+      });
+    }
+    await batch.commit();
 
     await writeAuditLog({
       action: "EMPLOYEE_CREATE",
       entity: "User",
-      entityId: created.user.id,
+      entityId: userId,
       userId: actor.id,
       storeId: actor.storeId,
       metadata: {
-        email: parsed.data.email,
-        username: created.username,
-        employeeCode: created.employeeCode,
+        email,
+        username: nextUsername,
+        employeeCode: code,
         roleCode: parsed.data.roleCode,
         permissions,
       },
     });
   } catch (error) {
+    if (userId) {
+      await rollbackAuthUser(userId);
+    }
     return formError(error);
   }
 
@@ -355,29 +344,21 @@ export async function updateEmployee(
     return formError(error);
   }
 
-  const target = await prisma.user.findFirst({
-    where: { id: userId, storeId: actor.storeId },
-    include: {
-      role: true,
-      employee: true,
-      grants: { include: { permission: true } },
-    },
-  });
-  if (!target) {
+  const target = await getUser(userId);
+  if (!target || target.storeId !== actor.storeId) {
     return { error: "Employee not found." };
   }
-  if (!canManageTarget(actor.roleCode, target.role.code)) {
+  if (!canManageTarget(actor.roleCode, target.roleCode)) {
     return { error: "You cannot edit this account." };
   }
 
+  const employee = await getEmployeeByUserId(userId);
   const nextActive = parsed.data.isActive ?? target.isActive;
   if (actor.id === userId && !nextActive) {
     return { error: "You cannot deactivate your own account." };
   }
 
-  const role = await prisma.role.findUnique({
-    where: { code: parsed.data.roleCode },
-  });
+  const role = getRoleDoc(parsed.data.roleCode);
   if (!role) {
     return { error: "Role not found." };
   }
@@ -387,100 +368,102 @@ export async function updateEmployee(
     parsed.data.roleCode,
     parsed.data.permissions,
   );
-  const previousPermissions = target.grants.map((grant) => grant.permission.code);
+  const previousPermissions = target.permissions;
   const phone = parsed.data.phone?.trim() || null;
   const jobTitle = parsed.data.jobTitle?.trim() || null;
-  const nextPasswordHash = raw.password ? await hashPassword(raw.password) : undefined;
 
   try {
-    await prisma.$transaction(async (tx) => {
-      const otherActiveOwnerCount = await countOtherActiveOwners(
-        tx,
-        actor.storeId,
-        userId,
-      );
-      if (
-        wouldRemoveLastOwner({
-          targetRoleCode: target.role.code,
-          targetIsActive: target.isActive,
-          nextRoleCode: parsed.data.roleCode,
-          nextIsActive: nextActive,
-          otherActiveOwnerCount,
-        })
-      ) {
-        throw new Error("The store must keep at least one active Owner.");
+    const otherActiveOwnerCount = await countOtherActiveOwners(actor.storeId, userId);
+    if (
+      wouldRemoveLastOwner({
+        targetRoleCode: target.roleCode,
+        targetIsActive: target.isActive,
+        nextRoleCode: parsed.data.roleCode,
+        nextIsActive: nextActive,
+        otherActiveOwnerCount,
+      })
+    ) {
+      throw new Error("The store must keep at least one active Owner.");
+    }
+
+    const nextUsername =
+      username ?? (await uniqueUsername(parsed.data.email.split("@")[0] ?? "employee", userId));
+    if (username) {
+      const taken = await findUserByUsername(nextUsername);
+      if (taken && taken.id !== userId) {
+        throw new Error("That username is already in use.");
       }
-
-      const nextUsername =
-        username ??
-        (await uniqueUsername(tx, parsed.data.email.split("@")[0] ?? "employee", userId));
-      if (username) {
-        const taken = await tx.user.findFirst({
-          where: { username: nextUsername, id: { not: userId } },
-          select: { id: true },
-        });
-        if (taken) {
-          throw new Error("That username is already in use.");
-        }
+    }
+    if (parsed.data.email !== target.email) {
+      const takenEmail = await findUserByEmail(parsed.data.email);
+      if (takenEmail && takenEmail.id !== userId) {
+        throw new Error("That email is already in use.");
       }
+    }
 
-      await tx.user.update({
-        where: { id: userId },
-        data: {
-          name: parsed.data.name,
-          email: parsed.data.email,
-          username: nextUsername,
-          roleId: role.id,
-          isActive: nextActive,
-          ...(nextPasswordHash ? { passwordHash: nextPasswordHash } : {}),
-        },
-      });
-
-      const nextCode =
-        employeeCode ??
-        target.employee?.employeeCode ??
-        (await allocateEmployeeCode(tx, actor.storeId));
-
-      if (employeeCode && employeeCode !== target.employee?.employeeCode) {
-        const taken = await tx.employee.findUnique({
-          where: {
-            storeId_employeeCode: { storeId: actor.storeId, employeeCode },
-          },
-          select: { id: true },
-        });
-        if (taken) {
-          throw new Error("That Employee ID is already in use.");
-        }
+    const nextCode =
+      employeeCode ?? employee?.employeeCode ?? (await allocateEmployeeCode(actor.storeId));
+    if (employeeCode && employeeCode !== employee?.employeeCode) {
+      const employees = await listEmployeesByStore(actor.storeId);
+      if (employees.some((row) => row.employeeCode === employeeCode && row.userId !== userId)) {
+        throw new Error("That Employee ID is already in use.");
       }
+    }
 
-      if (target.employee) {
-        await tx.employee.update({
-          where: { userId },
-          data: {
-            employeeCode: nextCode,
-            phone,
-            jobTitle,
-            salary: parsed.data.salary ? toMoney(parsed.data.salary) : null,
-            isActive: nextActive,
-          },
-        });
-      } else {
-        await tx.employee.create({
-          data: {
-            storeId: actor.storeId,
-            userId,
-            employeeCode: nextCode,
-            phone,
-            jobTitle,
-            hireDate: new Date(),
-            salary: parsed.data.salary ? toMoney(parsed.data.salary) : null,
-            isActive: nextActive,
-          },
-        });
-      }
-
-      await replaceUserPermissions(tx, userId, permissions);
+    await adminAuth.updateUser(userId, {
+      email: parsed.data.email,
+      displayName: parsed.data.name,
+      disabled: !nextActive,
+      ...(raw.password ? { password: raw.password } : {}),
     });
+
+    const now = FieldValue.serverTimestamp();
+    await firestore.collection(collections.users).doc(userId).set(
+      {
+        name: parsed.data.name,
+        email: parsed.data.email,
+        username: nextUsername,
+        phone,
+        roleId: role.id,
+        roleCode: role.code,
+        roleName: role.name,
+        permissions,
+        isActive: nextActive,
+        updatedAt: now,
+      },
+      { merge: true },
+    );
+
+    if (employee) {
+      await firestore.collection(collections.employees).doc(employee.id).set(
+        {
+          employeeCode: nextCode,
+          phone,
+          jobTitle,
+          salary: parsed.data.salary ? toMoney(parsed.data.salary).toString() : null,
+          isActive: nextActive,
+          updatedAt: now,
+        },
+        { merge: true },
+      );
+    } else {
+      const employeeId = newId(collections.employees);
+      await firestore.collection(collections.employees).doc(employeeId).set({
+        id: employeeId,
+        storeId: actor.storeId,
+        userId,
+        employeeCode: nextCode,
+        phone,
+        jobTitle,
+        hireDate: now,
+        salary: parsed.data.salary ? toMoney(parsed.data.salary).toString() : null,
+        isActive: nextActive,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    await replaceUserPermissions(userId, permissions);
   } catch (error) {
     return formError(error);
   }
@@ -494,21 +477,21 @@ export async function updateEmployee(
     metadata: {
       email: parsed.data.email,
       username: username ?? target.username,
-      employeeCode: employeeCode ?? target.employee?.employeeCode,
+      employeeCode: employeeCode ?? employee?.employeeCode,
       roleCode: parsed.data.roleCode,
       isActive: nextActive,
       permissions,
     },
   });
 
-  if (target.role.code !== parsed.data.roleCode) {
+  if (target.roleCode !== parsed.data.roleCode) {
     await writeAuditLog({
       action: "EMPLOYEE_ROLE_CHANGE",
       entity: "User",
       entityId: userId,
       userId: actor.id,
       storeId: actor.storeId,
-      metadata: { from: target.role.code, to: parsed.data.roleCode },
+      metadata: { from: target.roleCode, to: parsed.data.roleCode },
     });
   }
 
@@ -546,40 +529,38 @@ export async function setEmployeeActive(userId: string, nextActive: boolean) {
     throw new Error("You cannot deactivate your own account.");
   }
 
-  const target = await prisma.user.findFirst({
-    where: { id: userId, storeId: actor.storeId },
-    include: { role: true, employee: true },
-  });
-  if (!target) {
+  const target = await getUser(userId);
+  if (!target || target.storeId !== actor.storeId) {
     throw new Error("Employee not found.");
   }
-  if (!canManageTarget(actor.roleCode, target.role.code)) {
+  if (!canManageTarget(actor.roleCode, target.roleCode)) {
     throw new Error("You cannot change this account.");
   }
 
-  await prisma.$transaction(async (tx) => {
-    if (
-      wouldRemoveLastOwner({
-        targetRoleCode: target.role.code,
-        targetIsActive: target.isActive,
-        nextIsActive: nextActive,
-        otherActiveOwnerCount: await countOtherActiveOwners(tx, actor.storeId, userId),
-      })
-    ) {
-      throw new Error("The store must keep at least one active Owner.");
-    }
+  if (
+    wouldRemoveLastOwner({
+      targetRoleCode: target.roleCode,
+      targetIsActive: target.isActive,
+      nextIsActive: nextActive,
+      otherActiveOwnerCount: await countOtherActiveOwners(actor.storeId, userId),
+    })
+  ) {
+    throw new Error("The store must keep at least one active Owner.");
+  }
 
-    await tx.user.update({
-      where: { id: userId },
-      data: { isActive: nextActive },
-    });
-    if (target.employee) {
-      await tx.employee.update({
-        where: { userId },
-        data: { isActive: nextActive },
-      });
-    }
-  });
+  const employee = await getEmployeeByUserId(userId);
+  const now = FieldValue.serverTimestamp();
+  await adminAuth.updateUser(userId, { disabled: !nextActive });
+  await firestore.collection(collections.users).doc(userId).set(
+    { isActive: nextActive, updatedAt: now },
+    { merge: true },
+  );
+  if (employee) {
+    await firestore.collection(collections.employees).doc(employee.id).set(
+      { isActive: nextActive, updatedAt: now },
+      { merge: true },
+    );
+  }
 
   await writeAuditLog({
     action: nextActive ? "EMPLOYEE_ACTIVATE" : "EMPLOYEE_DEACTIVATE",
@@ -594,11 +575,8 @@ export async function setEmployeeActive(userId: string, nextActive: boolean) {
 
 export async function toggleEmployeeActive(userId: string) {
   const actor = await requireStorePermission("users");
-  const target = await prisma.user.findFirst({
-    where: { id: userId, storeId: actor.storeId },
-    select: { isActive: true },
-  });
-  if (!target) {
+  const target = await getUser(userId);
+  if (!target || target.storeId !== actor.storeId) {
     throw new Error("Employee not found.");
   }
   await setEmployeeActive(userId, !target.isActive);
@@ -617,22 +595,19 @@ export async function resetEmployeePassword(
     return { error: parsed.error.issues[0]?.message ?? "Enter a valid password." };
   }
 
-  const target = await prisma.user.findFirst({
-    where: { id: userId, storeId: actor.storeId },
-    include: { role: true },
-  });
-  if (!target) {
+  const target = await getUser(userId);
+  if (!target || target.storeId !== actor.storeId) {
     return { error: "Employee not found." };
   }
-  if (!canManageTarget(actor.roleCode, target.role.code)) {
+  if (!canManageTarget(actor.roleCode, target.roleCode)) {
     return { error: "You cannot reset this password." };
   }
 
-  const passwordHash = await hashPassword(parsed.data.password);
-  await prisma.user.update({
-    where: { id: userId },
-    data: { passwordHash },
-  });
+  try {
+    await adminAuth.updateUser(userId, { password: parsed.data.password });
+  } catch (error) {
+    return formError(error);
+  }
 
   await writeAuditLog({
     action: "EMPLOYEE_PASSWORD_RESET",
@@ -646,12 +621,6 @@ export async function resetEmployeePassword(
 }
 
 export async function listAssignableRoles(actorRole: string) {
-  const codes = assignableRoles(actorRole);
-  if (codes.length === 0) {
-    return [];
-  }
-  return prisma.role.findMany({
-    where: { code: { in: codes } },
-    orderBy: { name: "asc" },
-  });
+  const codes = new Set(assignableRoles(actorRole));
+  return listRoleDocs(true).filter((role) => codes.has(role.code as RoleCode));
 }

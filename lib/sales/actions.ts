@@ -4,8 +4,17 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
 import { writeAuditLog } from "@/lib/auth/audit";
-import { prisma } from "@/lib/db";
-import { applyStockChange } from "@/lib/inventory";
+import { collections, FieldValue, newId, serializeValue } from "@/lib/data/fs";
+import {
+  getHeldCart,
+  getSale,
+  hydrateSale,
+  listHeldCarts,
+  listReturnsForSale,
+} from "@/lib/data/queries";
+import type { InventoryDoc } from "@/lib/data/types";
+import { firestore } from "@/lib/firebase-admin";
+import { readInventoryInTx, writeStockChange } from "@/lib/inventory";
 import { requireStorePermission } from "@/lib/permissions";
 import {
   checkoutSale,
@@ -63,67 +72,87 @@ export async function completeSaleAction(input: {
 
 export async function holdCartAction(payload: unknown, label?: string, customerId?: string) {
   const user = await requireStorePermission("sales");
-  await prisma.heldCart.create({
-    data: {
-      storeId: user.storeId,
-      cashierId: user.id,
-      customerId: customerId || null,
-      label: label || `Hold ${new Date().toLocaleTimeString()}`,
-      payload: payload as object,
-    },
+  const id = newId(collections.heldCarts);
+  await firestore.collection(collections.heldCarts).doc(id).set({
+    id,
+    storeId: user.storeId,
+    cashierId: user.id,
+    customerId: customerId || null,
+    label: label || `Hold ${new Date().toLocaleTimeString()}`,
+    payload: serializeValue(payload) ?? null,
+    createdAt: FieldValue.serverTimestamp(),
   });
   revalidatePath("/pos");
 }
 
 export async function listHeldCartsAction() {
   const user = await requireStorePermission("sales");
-  return prisma.heldCart.findMany({
-    where: { storeId: user.storeId, cashierId: user.id },
-    orderBy: { createdAt: "desc" },
-  });
+  return listHeldCarts(user.storeId, user.id);
 }
 
 export async function resumeHeldCartAction(id: string) {
   const user = await requireStorePermission("sales");
-  const cart = await prisma.heldCart.findFirst({
-    where: { id, storeId: user.storeId },
-  });
-  if (!cart) {
+  const cart = await getHeldCart(id);
+  if (!cart || cart.storeId !== user.storeId) {
     throw new Error("Held cart not found.");
   }
-  await prisma.heldCart.delete({ where: { id } });
+  await firestore.collection(collections.heldCarts).doc(id).delete();
   return cart;
 }
 
 export async function cancelSaleAction(saleId: string) {
   const user = await requireStorePermission("sales");
-  await prisma.$transaction(async (tx) => {
-    const sale = await tx.sale.findFirst({
-      where: { id: saleId, storeId: user.storeId },
-      include: { items: true, returns: true },
-    });
-    if (!sale || sale.status !== "COMPLETED") {
+  const existingReturns = await listReturnsForSale(user.storeId, saleId);
+  if (existingReturns.length > 0) {
+    throw new Error("Return this sale instead of cancelling it.");
+  }
+
+  await firestore.runTransaction(async (tx) => {
+    const saleSnap = await tx.get(firestore.collection(collections.sales).doc(saleId));
+    if (!saleSnap.exists) {
       throw new Error("Only completed sales with no returns can be cancelled.");
     }
-    if (sale.returns.length > 0) {
-      throw new Error("Return this sale instead of cancelling it.");
+    const sale = hydrateSale(saleSnap.id, saleSnap.data() ?? {});
+    if (sale.storeId !== user.storeId || sale.status !== "COMPLETED") {
+      throw new Error("Only completed sales with no returns can be cancelled.");
     }
+
+    const productIds = [...new Set(sale.items.map((item) => item.productId))];
+    const inventories: InventoryDoc[] = [];
+    for (const productId of productIds) {
+      inventories.push(await readInventoryInTx(tx, user.storeId, productId));
+    }
+    const remaining = new Map(
+      inventories.map((inventory) => [inventory.productId, inventory.quantity]),
+    );
+
     for (const item of sale.items) {
-      await applyStockChange(tx, {
-        storeId: user.storeId,
-        productId: item.productId,
-        type: "RETURN",
-        quantityDelta: item.quantity,
-        userId: user.id,
-        reason: "Sale cancelled",
-        referenceType: "Sale",
-        referenceId: sale.id,
-      });
+      const current = remaining.get(item.productId);
+      if (!current) {
+        throw new Error("Inventory record not found for this product.");
+      }
+      writeStockChange(
+        tx,
+        {
+          storeId: user.storeId,
+          productId: item.productId,
+          type: "RETURN",
+          quantityDelta: item.quantity,
+          userId: user.id,
+          reason: "Sale cancelled",
+          referenceType: "Sale",
+          referenceId: sale.id,
+        },
+        current,
+      );
+      remaining.set(item.productId, current.plus(item.quantity));
     }
-    await tx.sale.update({
-      where: { id: sale.id },
-      data: { status: "CANCELLED" },
-    });
+
+    tx.set(
+      firestore.collection(collections.sales).doc(sale.id),
+      { status: "CANCELLED" },
+      { merge: true },
+    );
   });
   await writeAuditLog({
     action: "SALE_CANCEL",
@@ -139,20 +168,19 @@ export async function cancelSaleAction(saleId: string) {
 export async function createReturnAction(formData: FormData) {
   const user = await requireStorePermission("sales");
   const saleId = String(formData.get("saleId") ?? "");
-  const refundMethod = String(formData.get("refundMethod") ?? "CASH") as
-    | "CASH"
-    | "CARD"
-    | "STORE_CREDIT";
-  const sale = await prisma.sale.findFirst({
-    where: { id: saleId, storeId: user.storeId },
-    include: { items: true, returns: { include: { items: true } } },
-  });
-  if (!sale || sale.status === "CANCELLED") {
+  const refundMethodRaw = String(formData.get("refundMethod") ?? "CASH");
+  const refundMethod =
+    refundMethodRaw === "CARD" || refundMethodRaw === "STORE_CREDIT"
+      ? refundMethodRaw
+      : "CASH";
+  const sale = await getSale(saleId);
+  if (!sale || sale.storeId !== user.storeId || sale.status === "CANCELLED") {
     throw new Error("Sale cannot be returned.");
   }
 
+  const existingReturns = await listReturnsForSale(user.storeId, saleId);
   const returnedQty = new Map<string, ReturnType<typeof toQty>>();
-  for (const existing of sale.returns.flatMap((entry) => entry.items)) {
+  for (const existing of existingReturns.flatMap((entry) => entry.items)) {
     returnedQty.set(
       existing.saleItemId,
       (returnedQty.get(existing.saleItemId) ?? toQty(0)).plus(existing.quantity),
@@ -170,53 +198,84 @@ export async function createReturnAction(formData: FormData) {
     throw new Error("Select at least one item to return.");
   }
 
-  const result = await prisma.$transaction(async (tx) => {
+  const returnId = newId(collections.returns);
+
+  await firestore.runTransaction(async (tx) => {
+    const saleSnap = await tx.get(firestore.collection(collections.sales).doc(sale.id));
+    if (!saleSnap.exists) {
+      throw new Error("Sale cannot be returned.");
+    }
+
+    const productIds = [...new Set(lines.map((line) => line.item.productId))];
+    const inventories: InventoryDoc[] = [];
+    for (const productId of productIds) {
+      inventories.push(await readInventoryInTx(tx, user.storeId, productId));
+    }
+
     let total = toMoney(0);
     for (const line of lines) {
       const already = returnedQty.get(line.item.id) ?? toQty(0);
       if (already.plus(line.qty).gt(line.item.quantity)) {
         throw new Error(`Return quantity exceeds sold quantity for ${line.item.name}.`);
       }
-      const unitNet = toMoney(
-        line.item.lineTotal.dividedBy(line.item.quantity),
-      );
+      const unitNet = toMoney(line.item.lineTotal.dividedBy(line.item.quantity));
       total = toMoney(total.plus(unitNet.times(line.qty)));
     }
 
-    const created = await tx.return.create({
-      data: {
-        storeId: user.storeId,
-        saleId: sale.id,
-        cashierId: user.id,
-        customerId: sale.customerId,
-        total,
-        items: {
-          create: lines.map((line) => ({
-            saleItemId: line.item.id,
-            productId: line.item.productId,
-            quantity: line.qty,
-            unitPrice: line.item.unitPrice,
-            lineTotal: toMoney(
-              toMoney(line.item.lineTotal.dividedBy(line.item.quantity)).times(line.qty),
-            ),
-          })),
-        },
-        refunds: {
-          create: { method: refundMethod, amount: total },
-        },
-      },
+    const returnItems = lines.map((line) => ({
+      id: newId(collections.returns),
+      saleItemId: line.item.id,
+      productId: line.item.productId,
+      quantity: line.qty,
+      unitPrice: line.item.unitPrice,
+      lineTotal: toMoney(
+        toMoney(line.item.lineTotal.dividedBy(line.item.quantity)).times(line.qty),
+      ),
+    }));
+    const refundId = newId(collections.returns);
+
+    tx.set(firestore.collection(collections.returns).doc(returnId), {
+      id: returnId,
+      storeId: user.storeId,
+      saleId: sale.id,
+      invoiceNumber: sale.invoiceNumber,
+      cashierId: user.id,
+      cashierName: user.name,
+      customerId: sale.customerId,
+      total: total.toString(),
+      note: null,
+      items: returnItems.map((item) => ({
+        ...item,
+        quantity: item.quantity.toString(),
+        unitPrice: item.unitPrice.toString(),
+        lineTotal: item.lineTotal.toString(),
+      })),
+      refunds: [{ id: refundId, method: refundMethod, amount: total.toString() }],
+      createdAt: FieldValue.serverTimestamp(),
     });
 
+    const remaining = new Map(
+      inventories.map((inventory) => [inventory.productId, inventory.quantity]),
+    );
     for (const line of lines) {
-      await applyStockChange(tx, {
-        storeId: user.storeId,
-        productId: line.item.productId,
-        type: "RETURN",
-        quantityDelta: line.qty,
-        userId: user.id,
-        referenceType: "Return",
-        referenceId: created.id,
-      });
+      const current = remaining.get(line.item.productId);
+      if (!current) {
+        throw new Error("Inventory record not found for this product.");
+      }
+      writeStockChange(
+        tx,
+        {
+          storeId: user.storeId,
+          productId: line.item.productId,
+          type: "RETURN",
+          quantityDelta: line.qty,
+          userId: user.id,
+          referenceType: "Return",
+          referenceId: returnId,
+        },
+        current,
+      );
+      remaining.set(line.item.productId, current.plus(line.qty));
     }
 
     const allReturned = sale.items.every((item) => {
@@ -225,18 +284,17 @@ export async function createReturnAction(formData: FormData) {
       return previous.plus(extra).gte(item.quantity);
     });
 
-    await tx.sale.update({
-      where: { id: sale.id },
-      data: { status: allReturned ? "RETURNED" : "PARTIALLY_RETURNED" },
-    });
-
-    return created;
+    tx.set(
+      firestore.collection(collections.sales).doc(sale.id),
+      { status: allReturned ? "RETURNED" : "PARTIALLY_RETURNED" },
+      { merge: true },
+    );
   });
 
   await writeAuditLog({
     action: "SALE_RETURN",
     entity: "Return",
-    entityId: result.id,
+    entityId: returnId,
     userId: user.id,
     storeId: user.storeId,
     metadata: { saleId, refundMethod },

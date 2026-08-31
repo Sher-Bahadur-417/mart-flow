@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { decrypt, SESSION_COOKIE } from "@/lib/auth/session-token";
 
-const publicRoutes = new Set(["/login"]);
+const publicRoutes = new Set(["/login", "/signup"]);
 
 function isPublicRoute(pathname: string) {
   return publicRoutes.has(pathname);
@@ -20,7 +20,7 @@ export default async function proxy(request: NextRequest) {
     return NextResponse.redirect(loginUrl);
   }
 
-  if (pathname === "/login" && isAuthenticated) {
+  if ((pathname === "/login" || pathname === "/signup") && isAuthenticated) {
     return NextResponse.redirect(new URL("/dashboard", request.url));
   }
 

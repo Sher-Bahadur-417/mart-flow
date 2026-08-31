@@ -2,10 +2,9 @@ import { notFound } from "next/navigation";
 
 import { EmployeeForm } from "@/components/employees/employee-form";
 import { PageHeader } from "@/components/layout/page-header";
-import { prisma } from "@/lib/db";
-import { updateEmployee } from "@/lib/employees/actions";
+import { listAssignableRoles, updateEmployee } from "@/lib/employees/actions";
+import { getEmployeeDetail } from "@/lib/employees/queries";
 import {
-  assignableRoles,
   canManageTarget,
   grantablePermissions,
 } from "@/lib/employees/rules";
@@ -20,19 +19,7 @@ export default async function EditEmployeePage({
 }) {
   const actor = await requireStorePermission("users");
   const { id } = await params;
-  const employee = await prisma.user.findFirst({
-    where: { id, storeId: actor.storeId },
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      username: true,
-      isActive: true,
-      role: { select: { code: true, name: true } },
-      employee: true,
-      grants: { select: { permission: { select: { code: true } } } },
-    },
-  });
+  const employee = await getEmployeeDetail(actor.storeId, id);
   if (!employee) {
     notFound();
   }
@@ -40,11 +27,7 @@ export default async function EditEmployeePage({
     notFound();
   }
 
-  const codes = assignableRoles(actor.roleCode);
-  const roles = await prisma.role.findMany({
-    where: { code: { in: codes } },
-    orderBy: { name: "asc" },
-  });
+  const roles = await listAssignableRoles(actor.roleCode);
   const action = updateEmployee.bind(null, employee.id);
 
   return (

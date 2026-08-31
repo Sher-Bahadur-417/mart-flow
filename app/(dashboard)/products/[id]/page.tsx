@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import { PageHeader } from "@/components/layout/page-header";
 import { buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { prisma } from "@/lib/db";
+import { getProductWithRelations } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { formatMoney } from "@/lib/utils/money";
 import { cn } from "@/lib/utils";
@@ -18,10 +18,7 @@ export default async function ProductDetailPage({
 }) {
   const user = await requireStorePermission("products");
   const { id } = await params;
-  const product = await prisma.product.findFirst({
-    where: { id, storeId: user.storeId },
-    include: { inventory: true, barcodes: true, category: true, brand: true, unit: true },
-  });
+  const product = await getProductWithRelations(user.storeId, id);
   if (!product) {
     notFound();
   }

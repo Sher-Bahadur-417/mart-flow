@@ -1,77 +1,73 @@
 import "server-only";
 
-import { Prisma } from "@prisma/client";
-
-import { prisma } from "@/lib/db";
+import {
+  getCustomer,
+  getSupplier,
+  listCustomerPayments,
+  listPurchases,
+  listReturns,
+  listSales,
+  listSupplierPayments,
+} from "@/lib/data/queries";
+import { Decimal } from "@/lib/utils/decimal";
 import { moneyZero, toMoney } from "@/lib/utils/money";
 
 export async function getCustomerOutstanding(storeId: string, customerId: string) {
-  const customer = await prisma.customer.findFirst({
-    where: { id: customerId, storeId },
-    include: {
-      sales: {
-        where: { status: { not: "CANCELLED" } },
-        select: { creditAmount: true },
-      },
-      payments: { select: { amount: true } },
-      returns: {
-        include: { refunds: { select: { method: true, amount: true } } },
-      },
-    },
-  });
-
-  if (!customer) {
+  const customer = await getCustomer(customerId);
+  if (!customer || customer.storeId !== storeId) {
     throw new Error("Customer not found.");
   }
 
-  const credits = customer.sales.reduce(
-    (total, sale) => total.plus(sale.creditAmount),
-    moneyZero,
-  );
-  const payments = customer.payments.reduce(
-    (total, payment) => total.plus(payment.amount),
-    moneyZero,
-  );
-  const storeCredit = customer.returns
+  const [sales, payments, returns] = await Promise.all([
+    listSales(storeId),
+    listCustomerPayments(storeId),
+    listReturns(storeId),
+  ]);
+
+  const credits = sales
+    .filter((sale) => sale.customerId === customerId && sale.status !== "CANCELLED")
+    .reduce((total, sale) => total.plus(sale.creditAmount), moneyZero);
+  const paid = payments
+    .filter((payment) => payment.customerId === customerId)
+    .reduce((total, payment) => total.plus(payment.amount), moneyZero);
+  const storeCredit = returns
+    .filter((entry) => entry.customerId === customerId)
     .flatMap((entry) => entry.refunds)
     .filter((refund) => refund.method === "STORE_CREDIT")
     .reduce((total, refund) => total.plus(refund.amount), moneyZero);
 
-  return toMoney(customer.openingBalance.plus(credits).minus(payments).minus(storeCredit));
+  return toMoney(customer.openingBalance.plus(credits).minus(paid).minus(storeCredit));
 }
 
 export async function getSupplierPayable(storeId: string, supplierId: string) {
-  const supplier = await prisma.supplier.findFirst({
-    where: { id: supplierId, storeId },
-    include: {
-      purchases: {
-        where: { status: { in: ["RECEIVED", "COMPLETED"] } },
-        select: { total: true },
-      },
-      payments: { select: { amount: true } },
-    },
-  });
-
-  if (!supplier) {
+  const supplier = await getSupplier(supplierId);
+  if (!supplier || supplier.storeId !== storeId) {
     throw new Error("Supplier not found.");
   }
 
-  const purchases = supplier.purchases.reduce(
-    (total, purchase) => total.plus(purchase.total),
-    moneyZero,
-  );
-  const payments = supplier.payments.reduce(
-    (total, payment) => total.plus(payment.amount),
-    moneyZero,
-  );
+  const [purchases, payments] = await Promise.all([
+    listPurchases(storeId),
+    listSupplierPayments(storeId),
+  ]);
 
-  return toMoney(supplier.openingBalance.plus(purchases).minus(payments));
+  const purchased = purchases
+    .filter(
+      (purchase) =>
+        purchase.supplierId === supplierId &&
+        (purchase.status === "RECEIVED" || purchase.status === "COMPLETED"),
+    )
+    .reduce((total, purchase) => total.plus(purchase.total), moneyZero);
+  const paid = payments
+    .filter((payment) => payment.supplierId === supplierId)
+    .reduce((total, payment) => total.plus(payment.amount), moneyZero);
+
+  return toMoney(supplier.openingBalance.plus(purchased).minus(paid));
 }
 
 export function assertCreditLimit(
-  outstanding: Prisma.Decimal,
-  extraCredit: Prisma.Decimal,
-  creditLimit: Prisma.Decimal | null,
+  outstanding: Decimal,
+  extraCredit: Decimal,
+  creditLimit: Decimal | null,
 ) {
   if (!creditLimit) {
     return;

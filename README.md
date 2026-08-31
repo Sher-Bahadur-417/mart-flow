@@ -1,14 +1,14 @@
 # MartFlow
 
-Production-ready mart management system. Stack: Next.js 16, React 19, TypeScript, Tailwind CSS v4, shadcn/ui (Base UI), Prisma 6, and PostgreSQL.
+Production-ready mart management system. Stack: Next.js 16, React 19, TypeScript, Tailwind CSS v4, shadcn/ui (Base UI), Firebase Auth, and Cloud Firestore.
 
-Money is stored as `Decimal(14,2)`. Quantities are `Decimal(14,3)`. Stock only changes through inventory movements. Khata balances are computed from transactions and are never overwritten.
+Money is stored as decimal strings (`Decimal` with 2 places). Quantities use 3 places. Stock only changes through inventory movements. Khata balances are computed from transactions and are never overwritten.
 
 ## Requirements
 
 - Node.js 20+
 - npm
-- Docker Desktop (recommended) **or** a local PostgreSQL 16 instance
+- A Firebase project with Authentication (Email/Password) and Cloud Firestore enabled
 
 ## Setup
 
@@ -23,74 +23,63 @@ Set `SESSION_SECRET` in `.env` to a random string of at least 32 characters:
 node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 ```
 
-Start PostgreSQL, then apply migrations (auth, commerce, and employee management) and seed:
+Fill in the Firebase values from the Firebase console:
+
+- `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, and `FIREBASE_PRIVATE_KEY` come from a service account JSON (Project settings → Service accounts). The most reliable option on Windows is `FIREBASE_SERVICE_ACCOUNT_PATH` pointing at that JSON file. If you paste `FIREBASE_PRIVATE_KEY`, put it on one line in double quotes and keep the `\n` sequences from the JSON `private_key` field.
+- `NEXT_PUBLIC_FIREBASE_API_KEY` is the Web API key from Project settings → General.
+
+On macOS/Linux use `cp .env.example .env`.
 
 ```bash
-npm run db:up
-npx prisma migrate deploy
-npm run db:seed
 npm run dev
 ```
 
-If you prefer Prisma's interactive migrate:
+Open [http://localhost:3000](http://localhost:3000). Unauthenticated visitors are sent to `/login`. Create the first store owner at `/signup`.
 
-```bash
-npx prisma migrate dev
-```
-
-On macOS/Linux use `cp .env.example .env`. If PostgreSQL is already running, skip `db:up` and point `DATABASE_URL` at that instance.
-
-If `prisma generate` fails with `EPERM` on Windows, stop `next dev` first. The query engine DLL is locked while the app is running.
-
-Open [http://localhost:3000](http://localhost:3000). Unauthenticated visitors are sent to `/login`.
-
-## Seeded accounts
-
-Password is `SEED_USER_PASSWORD` (default `ChangeMe!123`).
-
-| Email | Username | Role |
-| --- | --- | --- |
-| admin@martflow.local | admin | Super Admin |
-| owner@martflow.local | owner | Owner |
-| manager@martflow.local | manager | Manager |
-| cashier@martflow.local | cashier | Cashier |
-| inventory@martflow.local | inventory | Inventory Staff |
-| accountant@martflow.local | accountant | Accountant |
-
-The seed also creates categories, units, six products with opening stock, a credit customer, a supplier, and expense categories so POS can be used immediately.
-
-Cashier can open POS, sales, and customers, but not products or settings. Accountant can open expenses and reports only. Sign in with email or username. Permission checks run on the server, not only in the sidebar.
+The login page can render without Firebase. After sign-in the dashboard uses the Admin SDK, so missing Firebase env vars show **This page couldn't load**.
 
 ## Scripts
 
 | Command | Purpose |
 | --- | --- |
 | `npm run dev` | Next.js development server |
-| `npm run build` | Generate Prisma Client, then production build |
+| `npm run build` | Production build |
 | `npm run start` | Serve the production build |
 | `npm run lint` | ESLint |
 | `npm test` | Permission, employee, money, and inventory unit tests |
-| `npm run db:up` | Start PostgreSQL via Docker Compose |
-| `npm run db:generate` | Generate Prisma Client |
-| `npm run db:migrate` | Create/apply Prisma migrations |
-| `npm run db:push` | Push schema without a migration file |
-| `npm run db:seed` | Seed roles, users, catalog, and demo stock |
-| `npm run db:studio` | Open Prisma Studio |
+
+## Username login
+
+Sign-in accepts email or username. Username lookup uses the Firestore `users.username` field (equality). Single-field equality indexes are created automatically. If the Firebase console asks for an index, create a single-field ascending index on `users.username` (and `users.email` if prompted).
 
 ## Environment
 
 ```
-DATABASE_URL="postgresql://martflow:martflow@localhost:5432/martflow?schema=public"
 NEXT_PUBLIC_APP_NAME="MartFlow"
 SESSION_SECRET="replace-with-a-long-random-string-at-least-32-chars"
-SEED_USER_PASSWORD="ChangeMe!123"
+NEXT_PUBLIC_FIREBASE_API_KEY=""
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=""
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=""
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=""
+NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=""
+NEXT_PUBLIC_FIREBASE_APP_ID=""
+NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID=""
+FIREBASE_PROJECT_ID=""
+FIREBASE_CLIENT_EMAIL=""
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
 ```
 
-Do not commit `.env`.
+Never put `FIREBASE_PRIVATE_KEY` or `FIREBASE_CLIENT_EMAIL` in `NEXT_PUBLIC_*` variables. Do not commit `.env`.
+
+### Vercel
+
+1. Create a Firebase project and enable Email/Password auth plus Firestore.
+2. In the Vercel project, set the same variables as `.env.example`.
+3. Redeploy. The first owner is created through `/signup` — there is no database seed.
 
 ## Modules
 
-- Auth, roles, and httpOnly sessions
+- Auth, roles, and httpOnly sessions (Firebase Auth + Firestore profiles)
 - Products, categories, barcodes, inventory movements
 - POS (search, cart, cash/card/credit, hold/resume, F2/F4/F8/F9)
 - Sales, returns, receipts (80mm print)

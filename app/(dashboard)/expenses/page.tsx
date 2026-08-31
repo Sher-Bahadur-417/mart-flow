@@ -1,5 +1,5 @@
 import { createExpense, createExpenseCategory } from "@/lib/expenses/actions";
-import { prisma } from "@/lib/db";
+import { listExpenseCategories, listExpenses } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader, EmptyState, Field, NativeSelect, Textarea } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -10,18 +10,15 @@ export const metadata = { title: "Expenses" };
 
 export default async function ExpensesPage() {
   const user = await requireStorePermission("expenses");
-  const [categories, expenses] = await Promise.all([
-    prisma.expenseCategory.findMany({
-      where: { storeId: user.storeId },
-      orderBy: { name: "asc" },
-    }),
-    prisma.expense.findMany({
-      where: { storeId: user.storeId },
-      include: { category: true, createdBy: true },
-      orderBy: { date: "desc" },
-      take: 100,
-    }),
+  const [categories, expenseRows] = await Promise.all([
+    listExpenseCategories(user.storeId),
+    listExpenses(user.storeId),
   ]);
+  const expenses = expenseRows.slice(0, 100).map((expense) => ({
+    ...expense,
+    category: { name: expense.categoryName },
+    createdBy: { name: expense.createdByName },
+  }));
 
   const today = new Date().toISOString().slice(0, 10);
 

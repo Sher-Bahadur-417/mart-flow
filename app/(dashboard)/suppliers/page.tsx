@@ -1,5 +1,5 @@
 import { createSupplier, recordSupplierPayment } from "@/lib/payments/actions";
-import { prisma } from "@/lib/db";
+import { listSuppliers } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader, EmptyState, Field, NativeSelect } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -11,10 +11,7 @@ export const metadata = { title: "Suppliers" };
 
 export default async function SuppliersPage() {
   const user = await requireStorePermission("suppliers");
-  const suppliers = await prisma.supplier.findMany({
-    where: { storeId: user.storeId },
-    orderBy: { name: "asc" },
-  });
+  const suppliers = await listSuppliers(user.storeId);
   const rows = await Promise.all(
     suppliers.map(async (supplier) => ({
       ...supplier,

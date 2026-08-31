@@ -1,5 +1,5 @@
 import { createCategory } from "@/lib/inventory/actions";
-import { prisma } from "@/lib/db";
+import { listCategories, listProducts } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader, EmptyState, Field } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -9,11 +9,16 @@ export const metadata = { title: "Categories" };
 
 export default async function CategoriesPage() {
   const user = await requireStorePermission("products");
-  const categories = await prisma.category.findMany({
-    where: { storeId: user.storeId },
-    include: { _count: { select: { products: true } } },
-    orderBy: { name: "asc" },
-  });
+  const [categories, products] = await Promise.all([
+    listCategories(user.storeId),
+    listProducts(user.storeId),
+  ]);
+  const rows = categories.map((category) => ({
+    ...category,
+    _count: {
+      products: products.filter((product) => product.categoryId === category.id).length,
+    },
+  }));
 
   return (
     <div className="flex flex-col gap-4 p-6">
@@ -26,11 +31,11 @@ export default async function CategoriesPage() {
           Add
         </Button>
       </form>
-      {categories.length === 0 ? (
+      {rows.length === 0 ? (
         <EmptyState title="No categories" description="Add a category to organize the catalog." />
       ) : (
         <ul className="divide-y rounded-xl border">
-          {categories.map((category) => (
+          {rows.map((category) => (
             <li key={category.id} className="flex items-center justify-between p-3 text-sm">
               <span>{category.name}</span>
               <span className="text-muted-foreground">{category._count.products} products</span>

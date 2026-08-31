@@ -1,5 +1,5 @@
 import { markNotificationRead, saveSetting } from "@/lib/settings/actions";
-import { prisma } from "@/lib/db";
+import { listAuditLogs, listNotifications, listSettings } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader, Field } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
@@ -10,23 +10,18 @@ export const metadata = { title: "Settings" };
 
 export default async function SettingsPage() {
   const user = await requireStorePermission("settings");
-  const [settings, auditLogs, notifications] = await Promise.all([
-    prisma.setting.findMany({ where: { storeId: user.storeId } }),
-    prisma.auditLog.findMany({
-      where: { storeId: user.storeId },
-      include: { user: true },
-      orderBy: { createdAt: "desc" },
-      take: 50,
-    }),
-    prisma.notification.findMany({
-      where: {
-        storeId: user.storeId,
-        OR: [{ userId: null }, { userId: user.id }],
-      },
-      orderBy: { createdAt: "desc" },
-      take: 20,
-    }),
+  const [settings, auditLogRows, notificationRows] = await Promise.all([
+    listSettings(user.storeId),
+    listAuditLogs(user.storeId),
+    listNotifications(user.storeId),
   ]);
+  const auditLogs = auditLogRows.slice(0, 50).map((log) => ({
+    ...log,
+    user: log.userName ? { name: log.userName } : null,
+  }));
+  const notifications = notificationRows
+    .filter((item) => item.userId == null || item.userId === user.id)
+    .slice(0, 20);
   const settingMap = new Map(settings.map((item) => [item.key, item.value]));
 
   return (

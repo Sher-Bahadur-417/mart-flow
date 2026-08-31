@@ -4,15 +4,25 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
 import { writeAuditLog } from "@/lib/auth/audit";
-import { prisma } from "@/lib/db";
-import { createProductInventory } from "@/lib/inventory";
+import { collections, FieldValue, newId } from "@/lib/data/fs";
+import { getProduct, listProducts } from "@/lib/data/queries";
+import { firestore } from "@/lib/firebase-admin";
+import {
+  createProductInventoryWrites,
+  readInventoryInTx,
+  writeStockChange,
+} from "@/lib/inventory";
 import { requireStorePermission } from "@/lib/permissions";
-import { toMoney, toQty, slugify } from "@/lib/utils/money";
-import { productSchema, categorySchema } from "@/lib/validation/catalog";
+import { slugify, toMoney, toQty } from "@/lib/utils/money";
+import { categorySchema, productSchema } from "@/lib/validation/catalog";
 
 function optionalId(value: FormDataEntryValue | null) {
   const text = String(value ?? "").trim();
   return text ? text : undefined;
+}
+
+function barcodeDocId(storeId: string, code: string) {
+  return `${storeId}_${code}`;
 }
 
 export async function createCategory(formData: FormData) {
@@ -23,12 +33,16 @@ export async function createCategory(formData: FormData) {
   }
 
   const slug = slugify(parsed.data.name) || `cat-${Date.now()}`;
-  await prisma.category.create({
-    data: {
-      storeId: user.storeId,
-      name: parsed.data.name,
-      slug,
-    },
+  const id = newId(collections.categories);
+  const now = FieldValue.serverTimestamp();
+  await firestore.collection(collections.categories).doc(id).set({
+    id,
+    storeId: user.storeId,
+    name: parsed.data.name,
+    slug,
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
   });
   await writeAuditLog({
     action: "CATEGORY_CREATE",
@@ -65,45 +79,70 @@ export async function createProduct(formData: FormData) {
   }
 
   const data = parsed.data;
-  const product = await prisma.$transaction(async (tx) => {
-    const created = await tx.product.create({
-      data: {
-        storeId: user.storeId,
-        name: data.name,
-        sku: data.sku.trim().toUpperCase(),
-        categoryId: data.categoryId,
-        brandId: data.brandId,
-        unitId: data.unitId,
-        purchasePrice: toMoney(data.purchasePrice),
-        sellingPrice: toMoney(data.sellingPrice),
-        taxRate: toMoney(data.taxRate),
-        discount: toMoney(data.discount),
-        minStock: toQty(data.minStock),
-        maxStock: data.maxStock ? toQty(data.maxStock) : null,
-        expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
-        isActive: data.isActive,
-      },
-    });
-    await createProductInventory(tx, {
-      storeId: user.storeId,
-      productId: created.id,
-    });
-    const barcode = data.barcode?.trim();
+  const sku = data.sku.trim().toUpperCase();
+  const existing = (await listProducts(user.storeId)).find((row) => row.sku === sku);
+  if (existing) {
+    throw new Error("That SKU is already in use.");
+  }
+
+  const barcode = data.barcode?.trim() || "";
+  const productId = newId(collections.products);
+  const barcodes = barcode ? [barcode] : [];
+
+  await firestore.runTransaction(async (tx) => {
     if (barcode) {
-      await tx.productBarcode.create({
-        data: { storeId: user.storeId, productId: created.id, code: barcode },
+      const barcodeSnap = await tx.get(
+        firestore.collection(collections.productBarcodes).doc(barcodeDocId(user.storeId, barcode)),
+      );
+      if (barcodeSnap.exists) {
+        throw new Error("That barcode is already in use.");
+      }
+    }
+
+    const now = FieldValue.serverTimestamp();
+    tx.set(firestore.collection(collections.products).doc(productId), {
+      id: productId,
+      storeId: user.storeId,
+      name: data.name,
+      sku,
+      categoryId: data.categoryId ?? null,
+      brandId: data.brandId ?? null,
+      unitId: data.unitId ?? null,
+      purchasePrice: toMoney(data.purchasePrice).toString(),
+      sellingPrice: toMoney(data.sellingPrice).toString(),
+      taxRate: toMoney(data.taxRate).toString(),
+      discount: toMoney(data.discount).toString(),
+      minStock: toQty(data.minStock).toString(),
+      maxStock: data.maxStock ? toQty(data.maxStock).toString() : null,
+      expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
+      imageUrl: null,
+      isActive: data.isActive,
+      barcodes,
+      createdAt: now,
+      updatedAt: now,
+    });
+    createProductInventoryWrites(tx, {
+      storeId: user.storeId,
+      productId,
+    });
+    if (barcode) {
+      const barcodeId = barcodeDocId(user.storeId, barcode);
+      tx.set(firestore.collection(collections.productBarcodes).doc(barcodeId), {
+        id: barcodeId,
+        storeId: user.storeId,
+        productId,
+        code: barcode,
       });
     }
-    return created;
   });
 
   await writeAuditLog({
     action: "PRODUCT_CREATE",
     entity: "Product",
-    entityId: product.id,
+    entityId: productId,
     userId: user.id,
     storeId: user.storeId,
-    metadata: { sku: product.sku, sellingPrice: product.sellingPrice.toString() },
+    metadata: { sku, sellingPrice: toMoney(data.sellingPrice).toString() },
   });
   revalidatePath("/products");
   redirect("/products");
@@ -111,10 +150,8 @@ export async function createProduct(formData: FormData) {
 
 export async function updateProduct(productId: string, formData: FormData) {
   const user = await requireStorePermission("products");
-  const existing = await prisma.product.findFirst({
-    where: { id: productId, storeId: user.storeId },
-  });
-  if (!existing) {
+  const existing = await getProduct(productId);
+  if (!existing || existing.storeId !== user.storeId) {
     throw new Error("Product not found.");
   }
 
@@ -139,35 +176,62 @@ export async function updateProduct(productId: string, formData: FormData) {
   }
 
   const data = parsed.data;
+  const sku = data.sku.trim().toUpperCase();
+  const skuTaken = (await listProducts(user.storeId)).find(
+    (row) => row.sku === sku && row.id !== productId,
+  );
+  if (skuTaken) {
+    throw new Error("That SKU is already in use.");
+  }
+
   const priceChanged =
     !existing.sellingPrice.equals(toMoney(data.sellingPrice)) ||
     !existing.purchasePrice.equals(toMoney(data.purchasePrice));
+  const barcode = data.barcode?.trim() || "";
 
-  await prisma.$transaction(async (tx) => {
-    await tx.product.update({
-      where: { id: productId },
-      data: {
+  await firestore.runTransaction(async (tx) => {
+    if (barcode) {
+      const barcodeSnap = await tx.get(
+        firestore.collection(collections.productBarcodes).doc(barcodeDocId(user.storeId, barcode)),
+      );
+      if (barcodeSnap.exists && String(barcodeSnap.data()?.productId ?? "") !== productId) {
+        throw new Error("That barcode is already in use.");
+      }
+    }
+
+    const barcodes = barcode
+      ? Array.from(new Set([...existing.barcodes, barcode]))
+      : existing.barcodes;
+
+    tx.set(
+      firestore.collection(collections.products).doc(productId),
+      {
         name: data.name,
-        sku: data.sku.trim().toUpperCase(),
+        sku,
         categoryId: data.categoryId ?? null,
         brandId: data.brandId ?? null,
         unitId: data.unitId ?? null,
-        purchasePrice: toMoney(data.purchasePrice),
-        sellingPrice: toMoney(data.sellingPrice),
-        taxRate: toMoney(data.taxRate),
-        discount: toMoney(data.discount),
-        minStock: toQty(data.minStock),
-        maxStock: data.maxStock ? toQty(data.maxStock) : null,
+        purchasePrice: toMoney(data.purchasePrice).toString(),
+        sellingPrice: toMoney(data.sellingPrice).toString(),
+        taxRate: toMoney(data.taxRate).toString(),
+        discount: toMoney(data.discount).toString(),
+        minStock: toQty(data.minStock).toString(),
+        maxStock: data.maxStock ? toQty(data.maxStock).toString() : null,
         expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
         isActive: data.isActive,
+        barcodes,
+        updatedAt: FieldValue.serverTimestamp(),
       },
-    });
-    const barcode = data.barcode?.trim();
+      { merge: true },
+    );
+
     if (barcode) {
-      await tx.productBarcode.upsert({
-        where: { storeId_code: { storeId: user.storeId, code: barcode } },
-        update: { productId },
-        create: { storeId: user.storeId, productId, code: barcode },
+      const barcodeId = barcodeDocId(user.storeId, barcode);
+      tx.set(firestore.collection(collections.productBarcodes).doc(barcodeId), {
+        id: barcodeId,
+        storeId: user.storeId,
+        productId,
+        code: barcode,
       });
     }
   });
@@ -205,37 +269,36 @@ export async function adjustStock(formData: FormData) {
     throw new Error("Adjustment reason is required.");
   }
 
-  await prisma.$transaction(async (tx) => {
-    const inventory = await tx.inventory.findFirst({
-      where: { productId, storeId: user.storeId },
-    });
-    if (!inventory) {
-      throw new Error("Inventory not found.");
-    }
+  await firestore.runTransaction(async (tx) => {
+    const inventory = await readInventoryInTx(tx, user.storeId, productId);
     const delta = quantityAfter.minus(inventory.quantity);
     if (delta.isZero()) {
       return;
     }
-    const { applyStockChange } = await import("@/lib/inventory");
-    await applyStockChange(tx, {
-      storeId: user.storeId,
-      productId,
-      type: "ADJUSTMENT",
-      quantityDelta: delta,
-      userId: user.id,
-      reason,
-      referenceType: "StockAdjustment",
-      allowNegative: true,
-    });
-    await tx.stockAdjustment.create({
-      data: {
+    writeStockChange(
+      tx,
+      {
         storeId: user.storeId,
         productId,
-        quantityBefore: inventory.quantity,
-        quantityAfter,
+        type: "ADJUSTMENT",
+        quantityDelta: delta,
+        userId: user.id,
         reason,
-        createdById: user.id,
+        referenceType: "StockAdjustment",
+        allowNegative: true,
       },
+      inventory.quantity,
+    );
+    const adjustmentId = newId(collections.stockAdjustments);
+    tx.set(firestore.collection(collections.stockAdjustments).doc(adjustmentId), {
+      id: adjustmentId,
+      storeId: user.storeId,
+      productId,
+      quantityBefore: inventory.quantity.toString(),
+      quantityAfter: quantityAfter.toString(),
+      reason,
+      createdById: user.id,
+      createdAt: FieldValue.serverTimestamp(),
     });
   });
 
@@ -259,17 +322,21 @@ export async function recordDamage(formData: FormData) {
     throw new Error("Quantity must be greater than zero.");
   }
 
-  const { applyStockChange } = await import("@/lib/inventory");
-  await prisma.$transaction(async (tx) => {
-    await applyStockChange(tx, {
-      storeId: user.storeId,
-      productId,
-      type: "DAMAGE",
-      quantityDelta: quantity.negated(),
-      userId: user.id,
-      reason,
-      referenceType: "Damage",
-    });
+  await firestore.runTransaction(async (tx) => {
+    const inventory = await readInventoryInTx(tx, user.storeId, productId);
+    writeStockChange(
+      tx,
+      {
+        storeId: user.storeId,
+        productId,
+        type: "DAMAGE",
+        quantityDelta: quantity.negated(),
+        userId: user.id,
+        reason,
+        referenceType: "Damage",
+      },
+      inventory.quantity,
+    );
   });
   revalidatePath("/inventory");
 }

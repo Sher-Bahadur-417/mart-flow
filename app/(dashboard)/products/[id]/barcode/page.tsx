@@ -1,7 +1,7 @@
 import { notFound } from "next/navigation";
 
 import { PrintButton } from "@/components/layout/print-button";
-import { prisma } from "@/lib/db";
+import { getProductWithRelations } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 
 export const metadata = { title: "Barcode" };
@@ -13,10 +13,7 @@ export default async function ProductBarcodePage({
 }) {
   const user = await requireStorePermission("products");
   const { id } = await params;
-  const product = await prisma.product.findFirst({
-    where: { id, storeId: user.storeId },
-    include: { barcodes: true },
-  });
+  const product = await getProductWithRelations(user.storeId, id);
   if (!product) {
     notFound();
   }

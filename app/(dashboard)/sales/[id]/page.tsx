@@ -4,7 +4,7 @@ import { PrintButton } from "@/components/layout/print-button";
 import { PageHeader } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
 import { cancelSaleAction, createReturnAction } from "@/lib/sales/actions";
-import { prisma } from "@/lib/db";
+import { getSale, getSetting, listReturnsForSale } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { formatMoney } from "@/lib/utils/money";
 
@@ -17,24 +17,20 @@ export default async function SaleDetailPage({
 }) {
   const user = await requireStorePermission("sales");
   const { id } = await params;
-  const [sale, footer] = await Promise.all([
-    prisma.sale.findFirst({
-      where: { id, storeId: user.storeId },
-      include: {
-        items: true,
-        payments: true,
-        cashier: true,
-        customer: true,
-        returns: { include: { items: true, refunds: true } },
-      },
-    }),
-    prisma.setting.findUnique({
-      where: { storeId_key: { storeId: user.storeId, key: "receipt_footer" } },
-    }),
+  const [record, footer, returns] = await Promise.all([
+    getSale(id),
+    getSetting(user.storeId, "receipt_footer"),
+    listReturnsForSale(user.storeId, id),
   ]);
-  if (!sale) {
+  if (!record || record.storeId !== user.storeId) {
     notFound();
   }
+  const sale = {
+    ...record,
+    cashier: { name: record.cashierName },
+    customer: record.customerName ? { name: record.customerName } : null,
+    returns,
+  };
   const cancel = cancelSaleAction.bind(null, sale.id);
 
   return (

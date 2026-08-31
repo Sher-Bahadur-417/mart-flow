@@ -3,7 +3,9 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
-import { prisma } from "@/lib/db";
+import { collections, FieldValue, newId } from "@/lib/data/fs";
+import { listExpenseCategories } from "@/lib/data/queries";
+import { firestore } from "@/lib/firebase-admin";
 import { requireStorePermission } from "@/lib/permissions";
 import { toMoney } from "@/lib/utils/money";
 import { expenseSchema } from "@/lib/validation/catalog";
@@ -14,8 +16,11 @@ export async function createExpenseCategory(formData: FormData) {
   if (!name) {
     throw new Error("Category name is required.");
   }
-  await prisma.expenseCategory.create({
-    data: { storeId: user.storeId, name },
+  const id = newId(collections.expenseCategories);
+  await firestore.collection(collections.expenseCategories).doc(id).set({
+    id,
+    storeId: user.storeId,
+    name,
   });
   revalidatePath("/expenses");
 }
@@ -32,16 +37,24 @@ export async function createExpense(formData: FormData) {
   if (!parsed.success) {
     throw new Error(parsed.error.issues[0]?.message ?? "Invalid expense.");
   }
-  await prisma.expense.create({
-    data: {
-      storeId: user.storeId,
-      categoryId: parsed.data.categoryId,
-      amount: toMoney(parsed.data.amount),
-      date: new Date(parsed.data.date),
-      method: parsed.data.method,
-      description: parsed.data.description || null,
-      createdById: user.id,
-    },
+  const categories = await listExpenseCategories(user.storeId);
+  const category = categories.find((row) => row.id === parsed.data.categoryId);
+  if (!category) {
+    throw new Error("Category not found.");
+  }
+  const id = newId(collections.expenses);
+  await firestore.collection(collections.expenses).doc(id).set({
+    id,
+    storeId: user.storeId,
+    categoryId: parsed.data.categoryId,
+    categoryName: category.name,
+    amount: toMoney(parsed.data.amount).toString(),
+    date: new Date(parsed.data.date),
+    method: parsed.data.method,
+    description: parsed.data.description || null,
+    createdById: user.id,
+    createdByName: user.name,
+    createdAt: FieldValue.serverTimestamp(),
   });
   revalidatePath("/expenses");
   redirect("/expenses");

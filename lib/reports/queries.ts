@@ -1,6 +1,18 @@
 import "server-only";
 
-import { prisma } from "@/lib/db";
+import {
+  listCustomers,
+  listCustomerPayments,
+  listExpenses,
+  listInventories,
+  listProducts,
+  listPurchases,
+  listReturns,
+  listSales,
+  listSupplierPayments,
+  listSuppliers,
+} from "@/lib/data/queries";
+import type { InventoryDoc, ProductDoc } from "@/lib/data/types";
 import { computeProfit } from "@/lib/sales/pricing";
 import { moneyZero, toMoney } from "@/lib/utils/money";
 
@@ -12,42 +24,46 @@ function startOfDay(date: Date) {
 
 export async function getDashboardMetrics(storeId: string) {
   const today = startOfDay(new Date());
-  const [sales, purchases, expenses, products, customers, suppliers] =
-    await Promise.all([
-      prisma.sale.findMany({
-        where: { storeId, status: { not: "CANCELLED" }, createdAt: { gte: today } },
-        include: { items: true },
-      }),
-      prisma.purchase.findMany({
-        where: { storeId, status: { in: ["RECEIVED", "COMPLETED"] }, receivedAt: { gte: today } },
-      }),
-      prisma.expense.findMany({ where: { storeId, date: { gte: today } } }),
-      prisma.product.findMany({
-        where: { storeId },
-        include: { inventory: true },
-      }),
-      prisma.customer.findMany({
-        where: { storeId },
-        include: {
-          sales: { where: { status: { not: "CANCELLED" } }, select: { creditAmount: true } },
-          payments: { select: { amount: true } },
-          returns: { include: { refunds: true } },
-        },
-      }),
-      prisma.supplier.findMany({
-        where: { storeId },
-        include: {
-          purchases: {
-            where: { status: { in: ["RECEIVED", "COMPLETED"] } },
-            select: { total: true },
-          },
-          payments: { select: { amount: true } },
-        },
-      }),
-    ]);
+  const [
+    sales,
+    purchases,
+    expenses,
+    products,
+    inventories,
+    customers,
+    suppliers,
+    customerPayments,
+    returns,
+    supplierPayments,
+  ] = await Promise.all([
+    listSales(storeId),
+    listPurchases(storeId),
+    listExpenses(storeId),
+    listProducts(storeId),
+    listInventories(storeId),
+    listCustomers(storeId),
+    listSuppliers(storeId),
+    listCustomerPayments(storeId),
+    listReturns(storeId),
+    listSupplierPayments(storeId),
+  ]);
 
-  const revenue = sales.reduce((sum, sale) => sum.plus(sale.total), moneyZero);
-  const cogs = sales.reduce(
+  const todaySales = sales.filter(
+    (sale) => sale.status !== "CANCELLED" && sale.createdAt >= today,
+  );
+  const todayPurchases = purchases.filter(
+    (purchase) =>
+      (purchase.status === "RECEIVED" || purchase.status === "COMPLETED") &&
+      purchase.receivedAt != null &&
+      purchase.receivedAt >= today,
+  );
+  const todayExpenses = expenses.filter((expense) => expense.date >= today);
+  const inventoryByProduct = new Map(
+    inventories.map((row) => [row.productId, row]),
+  );
+
+  const revenue = todaySales.reduce((sum, sale) => sum.plus(sale.total), moneyZero);
+  const cogs = todaySales.reduce(
     (sum, sale) =>
       sum.plus(
         sale.items.reduce(
@@ -57,20 +73,26 @@ export async function getDashboardMetrics(storeId: string) {
       ),
     moneyZero,
   );
-  const purchaseTotal = purchases.reduce((sum, item) => sum.plus(item.total), moneyZero);
-  const expenseTotal = expenses.reduce((sum, item) => sum.plus(item.amount), moneyZero);
-  const lowStock = products.filter(
-    (product) =>
-      product.inventory && product.inventory.quantity.gt(0) && product.inventory.quantity.lte(product.minStock),
-  ).length;
-  const outOfStock = products.filter(
-    (product) => !product.inventory || product.inventory.quantity.lte(0),
-  ).length;
+  const purchaseTotal = todayPurchases.reduce((sum, item) => sum.plus(item.total), moneyZero);
+  const expenseTotal = todayExpenses.reduce((sum, item) => sum.plus(item.amount), moneyZero);
+  const lowStock = products.filter((product) => {
+    const inventory = inventoryByProduct.get(product.id);
+    return inventory && inventory.quantity.gt(0) && inventory.quantity.lte(product.minStock);
+  }).length;
+  const outOfStock = products.filter((product) => {
+    const inventory = inventoryByProduct.get(product.id);
+    return !inventory || inventory.quantity.lte(0);
+  }).length;
 
   const receivables = customers.reduce((sum, customer) => {
-    const credit = customer.sales.reduce((value, sale) => value.plus(sale.creditAmount), moneyZero);
-    const paid = customer.payments.reduce((value, payment) => value.plus(payment.amount), moneyZero);
-    const storeCredit = customer.returns
+    const credit = sales
+      .filter((sale) => sale.customerId === customer.id && sale.status !== "CANCELLED")
+      .reduce((value, sale) => value.plus(sale.creditAmount), moneyZero);
+    const paid = customerPayments
+      .filter((payment) => payment.customerId === customer.id)
+      .reduce((value, payment) => value.plus(payment.amount), moneyZero);
+    const storeCredit = returns
+      .filter((entry) => entry.customerId === customer.id)
       .flatMap((entry) => entry.refunds)
       .filter((refund) => refund.method === "STORE_CREDIT")
       .reduce((value, refund) => value.plus(refund.amount), moneyZero);
@@ -78,8 +100,16 @@ export async function getDashboardMetrics(storeId: string) {
   }, moneyZero);
 
   const payables = suppliers.reduce((sum, supplier) => {
-    const purchased = supplier.purchases.reduce((value, purchase) => value.plus(purchase.total), moneyZero);
-    const paid = supplier.payments.reduce((value, payment) => value.plus(payment.amount), moneyZero);
+    const purchased = purchases
+      .filter(
+        (purchase) =>
+          purchase.supplierId === supplier.id &&
+          (purchase.status === "RECEIVED" || purchase.status === "COMPLETED"),
+      )
+      .reduce((value, purchase) => value.plus(purchase.total), moneyZero);
+    const paid = supplierPayments
+      .filter((payment) => payment.supplierId === supplier.id)
+      .reduce((value, payment) => value.plus(payment.amount), moneyZero);
     return sum.plus(supplier.openingBalance.plus(purchased).minus(paid));
   }, moneyZero);
 
@@ -100,11 +130,9 @@ export async function getDashboardMetrics(storeId: string) {
 export async function getSalesTrend(storeId: string, days = 14) {
   const from = startOfDay(new Date());
   from.setDate(from.getDate() - (days - 1));
-  const sales = await prisma.sale.findMany({
-    where: { storeId, status: { not: "CANCELLED" }, createdAt: { gte: from } },
-    include: { items: true },
-    orderBy: { createdAt: "asc" },
-  });
+  const sales = (await listSales(storeId))
+    .filter((sale) => sale.status !== "CANCELLED" && sale.createdAt >= from)
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 
   const buckets = new Map<string, { sales: typeof moneyZero; profit: typeof moneyZero }>();
   for (let i = 0; i < days; i += 1) {
@@ -132,22 +160,17 @@ export async function getSalesTrend(storeId: string, days = 14) {
 }
 
 export async function getProfitLoss(storeId: string, from: Date, to: Date) {
-  const [sales, expenses] = await Promise.all([
-    prisma.sale.findMany({
-      where: {
-        storeId,
-        status: { not: "CANCELLED" },
-        createdAt: { gte: from, lte: to },
-      },
-      include: { items: true },
-    }),
-    prisma.expense.findMany({
-      where: { storeId, date: { gte: from, lte: to } },
-    }),
-  ]);
+  const [sales, expenses] = await Promise.all([listSales(storeId), listExpenses(storeId)]);
+  const rangedSales = sales.filter(
+    (sale) =>
+      sale.status !== "CANCELLED" && sale.createdAt >= from && sale.createdAt <= to,
+  );
+  const rangedExpenses = expenses.filter(
+    (expense) => expense.date >= from && expense.date <= to,
+  );
 
-  const revenue = sales.reduce((sum, sale) => sum.plus(sale.total), moneyZero);
-  const cogs = sales.reduce(
+  const revenue = rangedSales.reduce((sum, sale) => sum.plus(sale.total), moneyZero);
+  const cogs = rangedSales.reduce(
     (sum, sale) =>
       sum.plus(
         sale.items.reduce(
@@ -157,7 +180,7 @@ export async function getProfitLoss(storeId: string, from: Date, to: Date) {
       ),
     moneyZero,
   );
-  const expenseTotal = expenses.reduce((sum, item) => sum.plus(item.amount), moneyZero);
+  const expenseTotal = rangedExpenses.reduce((sum, item) => sum.plus(item.amount), moneyZero);
 
   return {
     from,
@@ -166,14 +189,22 @@ export async function getProfitLoss(storeId: string, from: Date, to: Date) {
     cogs: toMoney(cogs),
     expenses: toMoney(expenseTotal),
     profit: computeProfit(revenue, cogs, expenseTotal),
-    saleCount: sales.length,
+    saleCount: rangedSales.length,
   };
 }
 
-export async function getInventorySnapshot(storeId: string) {
-  return prisma.inventory.findMany({
-    where: { storeId },
-    include: { product: true },
-    orderBy: { product: { name: "asc" } },
-  });
+export type InventorySnapshotRow = InventoryDoc & { product: ProductDoc };
+
+export async function getInventorySnapshot(storeId: string): Promise<InventorySnapshotRow[]> {
+  const [inventories, products] = await Promise.all([
+    listInventories(storeId),
+    listProducts(storeId),
+  ]);
+  const productById = new Map(products.map((product) => [product.id, product]));
+  return inventories
+    .flatMap((row) => {
+      const product = productById.get(row.productId);
+      return product ? [{ ...row, product }] : [];
+    })
+    .sort((a, b) => a.product.name.localeCompare(b.product.name));
 }

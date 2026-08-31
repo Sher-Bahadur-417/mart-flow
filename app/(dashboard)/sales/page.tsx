@@ -1,7 +1,7 @@
 import Link from "next/link";
 
 import { PageHeader, EmptyState } from "@/components/layout/page-header";
-import { prisma } from "@/lib/db";
+import { listSales } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { formatMoney } from "@/lib/utils/money";
 
@@ -9,12 +9,11 @@ export const metadata = { title: "Sales" };
 
 export default async function SalesPage() {
   const user = await requireStorePermission("sales");
-  const sales = await prisma.sale.findMany({
-    where: { storeId: user.storeId },
-    include: { cashier: true, customer: true },
-    orderBy: { createdAt: "desc" },
-    take: 100,
-  });
+  const sales = (await listSales(user.storeId)).slice(0, 100).map((sale) => ({
+    ...sale,
+    customer: sale.customerName ? { name: sale.customerName } : null,
+    cashier: { name: sale.cashierName },
+  }));
 
   return (
     <div className="flex flex-col gap-4 p-6">

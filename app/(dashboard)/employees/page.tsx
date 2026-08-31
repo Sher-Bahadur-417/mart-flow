@@ -4,9 +4,9 @@ import { PageHeader, EmptyState, NativeSelect } from "@/components/layout/page-h
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { ROLE_CODES } from "@/constants/permissions";
-import { prisma } from "@/lib/db";
+import { listRoleDocs } from "@/lib/auth/bootstrap";
 import { setEmployeeActive } from "@/lib/employees/actions";
+import { listEmployeeDirectory } from "@/lib/employees/queries";
 import { canManageTarget } from "@/lib/employees/rules";
 import { requireStorePermission } from "@/lib/permissions";
 import { cn } from "@/lib/utils";
@@ -24,44 +24,36 @@ export default async function EmployeesPage({
   const role = typeof params.role === "string" ? params.role : "";
   const status = typeof params.status === "string" ? params.status : "all";
 
-  const [employees, roles] = await Promise.all([
-    prisma.user.findMany({
-      where: {
-        storeId: user.storeId,
-        ...(role ? { role: { code: role } } : {}),
-        ...(status === "active"
-          ? { isActive: true }
-          : status === "inactive"
-            ? { isActive: false }
-            : {}),
-        ...(q
-          ? {
-              OR: [
-                { name: { contains: q, mode: "insensitive" } },
-                { email: { contains: q, mode: "insensitive" } },
-                { username: { contains: q, mode: "insensitive" } },
-                { employee: { employeeCode: { contains: q, mode: "insensitive" } } },
-                { employee: { phone: { contains: q, mode: "insensitive" } } },
-              ],
-            }
-          : {}),
-      },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        username: true,
-        isActive: true,
-        role: { select: { code: true, name: true } },
-        employee: { select: { employeeCode: true, phone: true, jobTitle: true } },
-      },
-      orderBy: [{ isActive: "desc" }, { name: "asc" }],
-    }),
-    prisma.role.findMany({
-      where: { code: { not: ROLE_CODES.SUPER_ADMIN } },
-      orderBy: { name: "asc" },
-    }),
+  const [directory, roles] = await Promise.all([
+    listEmployeeDirectory(user.storeId),
+    Promise.resolve(listRoleDocs(true)),
   ]);
+
+  const term = q.toLowerCase();
+  const employees = directory.filter((employee) => {
+    if (role && employee.role.code !== role) {
+      return false;
+    }
+    if (status === "active" && !employee.isActive) {
+      return false;
+    }
+    if (status === "inactive" && employee.isActive) {
+      return false;
+    }
+    if (!term) {
+      return true;
+    }
+    const haystack = [
+      employee.name,
+      employee.email,
+      employee.username,
+      employee.employee?.employeeCode ?? "",
+      employee.employee?.phone ?? "",
+    ]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(term);
+  });
 
   return (
     <div className="flex flex-col gap-4 p-6">

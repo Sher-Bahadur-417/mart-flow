@@ -1,7 +1,7 @@
 import { notFound } from "next/navigation";
 
 import { updatePurchaseStatus } from "@/lib/purchases/actions";
-import { prisma } from "@/lib/db";
+import { getPurchase } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -16,13 +16,18 @@ export default async function PurchaseDetailPage({
 }) {
   const user = await requireStorePermission("purchases");
   const { id } = await params;
-  const purchase = await prisma.purchase.findFirst({
-    where: { id, storeId: user.storeId },
-    include: { supplier: true, items: { include: { product: true } } },
-  });
-  if (!purchase) {
+  const record = await getPurchase(id);
+  if (!record || record.storeId !== user.storeId) {
     notFound();
   }
+  const purchase = {
+    ...record,
+    supplier: { name: record.supplierName },
+    items: record.items.map((item) => ({
+      ...item,
+      product: { name: item.productName },
+    })),
+  };
 
   const order = updatePurchaseStatus.bind(null, purchase.id, "ORDERED");
   const receive = updatePurchaseStatus.bind(null, purchase.id, "RECEIVED");

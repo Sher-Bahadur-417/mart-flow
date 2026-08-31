@@ -1,19 +1,20 @@
-import { Prisma } from "@prisma/client";
+import { Decimal, type DecimalInput } from "@/lib/utils/decimal";
 
-export type DecimalInput = string | number | Prisma.Decimal;
+export type { DecimalInput };
+export { Decimal };
 
-export const moneyZero = new Prisma.Decimal(0);
-export const qtyZero = new Prisma.Decimal(0);
+export const moneyZero = new Decimal(0);
+export const qtyZero = new Decimal(0);
 
 export function toMoney(value: DecimalInput) {
-  return new Prisma.Decimal(value).toDecimalPlaces(2);
+  return new Decimal(value).toDecimalPlaces(2);
 }
 
 export function toQty(value: DecimalInput) {
-  return new Prisma.Decimal(value).toDecimalPlaces(3);
+  return new Decimal(value).toDecimalPlaces(3);
 }
 
-export function sumMoney(values: Prisma.Decimal[]) {
+export function sumMoney(values: Decimal[]) {
   return values.reduce((total, value) => total.plus(value), moneyZero);
 }
 

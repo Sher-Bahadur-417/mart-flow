@@ -1,5 +1,5 @@
 import { createCustomer, recordCustomerPayment } from "@/lib/payments/actions";
-import { prisma } from "@/lib/db";
+import { listCustomers } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader, EmptyState, Field, NativeSelect } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -11,10 +11,7 @@ export const metadata = { title: "Customers" };
 
 export default async function CustomersPage() {
   const user = await requireStorePermission("customers");
-  const customers = await prisma.customer.findMany({
-    where: { storeId: user.storeId },
-    orderBy: { name: "asc" },
-  });
+  const customers = await listCustomers(user.storeId);
   const rows = await Promise.all(
     customers.map(async (customer) => ({
       ...customer,

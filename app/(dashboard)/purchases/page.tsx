@@ -1,7 +1,7 @@
 import Link from "next/link";
 
 import { createPurchase } from "@/lib/purchases/actions";
-import { prisma } from "@/lib/db";
+import { listProducts, listPurchases, listSuppliers } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { PageHeader, EmptyState, Field, NativeSelect } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -12,15 +12,15 @@ export const metadata = { title: "Purchases" };
 
 export default async function PurchasesPage() {
   const user = await requireStorePermission("purchases");
-  const [purchases, suppliers, products] = await Promise.all([
-    prisma.purchase.findMany({
-      where: { storeId: user.storeId },
-      include: { supplier: true },
-      orderBy: { createdAt: "desc" },
-    }),
-    prisma.supplier.findMany({ where: { storeId: user.storeId } }),
-    prisma.product.findMany({ where: { storeId: user.storeId, isActive: true } }),
+  const [purchaseRows, suppliers, products] = await Promise.all([
+    listPurchases(user.storeId),
+    listSuppliers(user.storeId),
+    listProducts(user.storeId),
   ]);
+  const purchases = purchaseRows.map((purchase) => ({
+    ...purchase,
+    supplier: { name: purchase.supplierName },
+  }));
 
   return (
     <div className="flex flex-col gap-6 p-6">
@@ -38,11 +38,13 @@ export default async function PurchasesPage() {
         </Field>
         <Field label="Product">
           <NativeSelect name="productId" required>
-            {products.map((product) => (
-              <option key={product.id} value={product.id}>
-                {product.name}
-              </option>
-            ))}
+            {products
+              .filter((product) => product.isActive)
+              .map((product) => (
+                <option key={product.id} value={product.id}>
+                  {product.name}
+                </option>
+              ))}
           </NativeSelect>
         </Field>
         <Field label="Qty">

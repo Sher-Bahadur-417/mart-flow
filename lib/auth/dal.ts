@@ -3,8 +3,10 @@ import "server-only";
 import { cache } from "react";
 import { redirect } from "next/navigation";
 
-import { prisma } from "@/lib/db";
+import { ROLE_PERMISSIONS, type RoleCode } from "@/constants/permissions";
+import { isNextRedirect, publicAuthError } from "@/lib/auth/safe-error";
 import { decrypt, getSessionCookie } from "@/lib/auth/session";
+import { getStore, getUser } from "@/lib/data/queries";
 import type { SessionUser } from "@/types/auth";
 
 export const verifySession = cache(async () => {
@@ -26,57 +28,37 @@ export const getCurrentUser = cache(async (): Promise<SessionUser | null> => {
     return null;
   }
 
-  const user = await prisma.user.findUnique({
-    where: { id: session.userId },
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      isActive: true,
-      storeId: true,
-      store: { select: { name: true, isActive: true } },
-      grants: {
-        select: {
-          permission: { select: { code: true } },
-        },
-      },
-      role: {
-        select: {
-          code: true,
-          name: true,
-          permissions: {
-            select: {
-              permission: { select: { code: true } },
-            },
-          },
-        },
-      },
-    },
-  });
+  try {
+    const user = await getUser(session.userId);
+    if (!user || !user.isActive) {
+      return null;
+    }
 
-  if (!user || !user.isActive) {
-    return null;
+    const store = user.storeId ? await getStore(user.storeId) : null;
+    if (store && !store.isActive) {
+      return null;
+    }
+
+    const rolePermissions = ROLE_PERMISSIONS[user.roleCode as RoleCode] ?? [];
+    const granted = user.permissions;
+
+    return {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      roleCode: user.roleCode,
+      roleName: user.roleName,
+      storeId: user.storeId,
+      storeName: store?.name ?? null,
+      permissions: granted.length > 0 ? granted : [...rolePermissions],
+    };
+  } catch (error) {
+    if (isNextRedirect(error)) {
+      throw error;
+    }
+    console.error("getCurrentUser failed", error);
+    throw new Error(publicAuthError(error));
   }
-
-  if (user.store && !user.store.isActive) {
-    return null;
-  }
-
-  const granted = user.grants.map((entry) => entry.permission.code);
-  const rolePermissions = user.role.permissions.map(
-    (entry) => entry.permission.code,
-  );
-
-  return {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    roleCode: user.role.code,
-    roleName: user.role.name,
-    storeId: user.storeId,
-    storeName: user.store?.name ?? null,
-    permissions: granted.length > 0 ? granted : rolePermissions,
-  };
 });
 
 export async function requireUser() {

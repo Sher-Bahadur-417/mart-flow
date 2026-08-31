@@ -1,7 +1,7 @@
 import Link from "next/link";
 
 import { PageHeader, EmptyState } from "@/components/layout/page-header";
-import { prisma } from "@/lib/db";
+import { listReturns } from "@/lib/data/queries";
 import { requireStorePermission } from "@/lib/permissions";
 import { formatMoney } from "@/lib/utils/money";
 
@@ -9,11 +9,11 @@ export const metadata = { title: "Returns" };
 
 export default async function ReturnsPage() {
   const user = await requireStorePermission("sales");
-  const returns = await prisma.return.findMany({
-    where: { storeId: user.storeId },
-    include: { sale: true, cashier: true },
-    orderBy: { createdAt: "desc" },
-  });
+  const returns = (await listReturns(user.storeId)).map((entry) => ({
+    ...entry,
+    sale: { invoiceNumber: entry.invoiceNumber },
+    cashier: { name: entry.cashierName },
+  }));
 
   return (
     <div className="flex flex-col gap-4 p-6">

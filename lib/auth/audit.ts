@@ -1,9 +1,10 @@
 import "server-only";
 
-import type { Prisma } from "@prisma/client";
+import { FieldValue } from "firebase-admin/firestore";
 import { headers } from "next/headers";
 
-import { prisma } from "@/lib/db";
+import { collections, newId } from "@/lib/data/fs";
+import { firestore } from "@/lib/firebase-admin";
 
 type AuditInput = {
   action: string;
@@ -11,7 +12,7 @@ type AuditInput = {
   entityId?: string | null;
   userId?: string | null;
   storeId?: string | null;
-  metadata?: Prisma.InputJsonObject;
+  metadata?: Record<string, unknown> | null;
 };
 
 export async function getRequestContext() {
@@ -29,17 +30,22 @@ export async function getRequestContext() {
 export async function writeAuditLog(input: AuditInput) {
   try {
     const { ipAddress, userAgent } = await getRequestContext();
-    await prisma.auditLog.create({
-      data: {
-        action: input.action,
-        entity: input.entity,
-        entityId: input.entityId ?? null,
-        userId: input.userId ?? null,
-        storeId: input.storeId ?? null,
-        metadata: input.metadata,
-        ipAddress,
-        userAgent,
-      },
+    let userName: string | null = null;
+    if (input.userId) {
+      const userSnap = await firestore.collection(collections.users).doc(input.userId).get();
+      userName = userSnap.exists ? String(userSnap.data()?.name ?? "") : null;
+    }
+    await firestore.collection(collections.auditLogs).doc(newId(collections.auditLogs)).set({
+      action: input.action,
+      entity: input.entity,
+      entityId: input.entityId ?? null,
+      userId: input.userId ?? null,
+      userName,
+      storeId: input.storeId ?? null,
+      metadata: input.metadata ?? null,
+      ipAddress,
+      userAgent,
+      createdAt: FieldValue.serverTimestamp(),
     });
   } catch (error) {
     console.error("Failed to write audit log", error);

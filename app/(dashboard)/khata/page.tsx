@@ -1,5 +1,5 @@
 import { recordCustomerPayment, recordSupplierPayment } from "@/lib/payments/actions";
-import { prisma } from "@/lib/db";
+import { listCustomers, listSuppliers } from "@/lib/data/queries";
 import { hasPermission, requireStorePermission } from "@/lib/permissions";
 import { PageHeader, EmptyState, NativeSelect } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
@@ -13,10 +13,8 @@ export default async function KhataPage() {
   const user = await requireStorePermission("customers");
   const canSuppliers = hasPermission(user, "suppliers");
   const [customers, suppliers] = await Promise.all([
-    prisma.customer.findMany({ where: { storeId: user.storeId }, orderBy: { name: "asc" } }),
-    canSuppliers
-      ? prisma.supplier.findMany({ where: { storeId: user.storeId }, orderBy: { name: "asc" } })
-      : Promise.resolve([]),
+    listCustomers(user.storeId),
+    canSuppliers ? listSuppliers(user.storeId) : Promise.resolve([]),
   ]);
   const customerRows = await Promise.all(
     customers.map(async (customer) => ({
